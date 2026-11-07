@@ -1,0 +1,155 @@
+name: Build zh-CN APK
+
+# 自动流程：每 6 小时检查上游 MOTO-HUB ADV-SOLO 是否有新版本。
+# 有新版本 -> 下载官方 APK -> 注入中文词库（缺的条目可自动翻译）-> 重建 -> 用固定密钥签名
+#           -> 在本仓库发布 release，手机端用 Obtainium 订阅本仓库即可在线更新。
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "忽略「已发布过同一版本」的判断，强制重打"
+        type: boolean
+        default: false
+      skip_translate:
+        description: "跳过自动翻译（新增条目暂时回退英文）"
+        type: boolean
+        default: false
+
+concurrency:
+  group: zh-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 缓存 apktool
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apktool
+          key: apktool-3.0.3
+
+      - name: 准备 apktool
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/apktool
+          JAR="$HOME/.cache/apktool/apktool_3.0.3.jar"
+          if [ ! -f "$JAR" ]; then
+            curl -fsSL -o "$JAR" \
+              https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar
+          fi
+          java -jar "$JAR" --version
+          echo "APKTOOL_JAR=$JAR" >> "$GITHUB_ENV"
+
+      - name: 定位 Android build-tools（zipalign / apksigner）
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          BT="$(ls -d "$SDK"/build-tools/* 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$BT" ] || [ ! -x "$BT/apksigner" ]; then
+            echo "预装 build-tools 不可用，尝试安装…"
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" "build-tools;35.0.0" >/dev/null 2>&1 || true
+            BT="$(ls -d "$SDK"/build-tools/* 2>/dev/null | sort -V | tail -n1 || true)"
+          fi
+          test -x "$BT/apksigner"
+          test -x "$BT/zipalign"
+          echo "BUILD_TOOLS=$BT" >> "$GITHUB_ENV"
+          "$BT/apksigner" version
+
+      - name: 还原签名密钥
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/motohub-zh.jks"
+          echo "KEYSTORE=$RUNNER_TEMP/motohub-zh.jks" >> "$GITHUB_ENV"
+
+      - name: 构建中文包
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_REPO: ${{ github.repository }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+          TRANSLATE_API_KEY: ${{ secrets.TRANSLATE_API_KEY }}
+          TRANSLATE_BASE_URL: ${{ vars.TRANSLATE_BASE_URL }}
+          TRANSLATE_MODEL: ${{ vars.TRANSLATE_MODEL }}
+          MODULE_MIRROR_URL: ${{ vars.MODULE_MIRROR_URL }}
+          WORK_DIR: ${{ runner.temp }}/work
+          OUT_DIR: ${{ runner.temp }}/out
+        run: |
+          python3 tools/zh_pipeline.py ${{ inputs.force && '--force' || '' }} ${{ inputs.skip_translate && '--skip-translate' || '' }}
+
+      - name: 读取构建结果
+        id: info
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/work/build-info.json"
+          test -f "$F"
+          python3 - <<'PY'
+          import json, os
+          info = json.load(open(os.environ["RUNNER_TEMP"] + "/work/build-info.json", encoding="utf-8"))
+          out = open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8")
+          out.write(f"skip={1 if info.get('skipped') else 0}\n")
+          for k in ("versionCode", "versionName", "sha256", "file", "zh_written", "untranslated"):
+              if k in info:
+                  out.write(f"{k}={info[k]}\n")
+          PY
+
+      - name: 发布 release
+        if: steps.info.outputs.skip == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VC: ${{ steps.info.outputs.versionCode }}
+          VN: ${{ steps.info.outputs.versionName }}
+          SHA: ${{ steps.info.outputs.sha256 }}
+          WRITTEN: ${{ steps.info.outputs.zh_written }}
+          UNTR: ${{ steps.info.outputs.untranslated }}
+        run: |
+          set -euo pipefail
+          APK="$(ls "$RUNNER_TEMP/out"/*.apk | head -n1)"
+          NOTES=$(printf 'MOTO-HUB ADV-SOLO %s (versionCode %s) — 简体中文汉化包\n\n- 中文条目：%s\n- 本次仍缺译（回退英文）：%s\n- SHA-256：%s\n- 安装：与上一版汉化包同一签名，可直接覆盖安装（无需卸载、不丢数据）\n' \
+            "$VN" "$VC" "$WRITTEN" "$UNTR" "$SHA")
+          gh release create "zh-$VC" "$APK" \
+            --title "zh-CN $VN (build $VC)" \
+            --notes "$NOTES" \
+            --latest=false || gh release upload "zh-$VC" "$APK" --clobber
+
+      - name: 保存构建产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zh-build-${{ steps.info.outputs.versionCode || 'unknown' }}
+          path: |
+            ${{ runner.temp }}/out/*.apk
+            ${{ runner.temp }}/work/build-info.json
+            ${{ runner.temp }}/work/untranslated.json
+          if-no-files-found: warn
+
+      - name: 构建摘要
+        if: always()
+        run: |
+          {
+            echo "### zh-CN 构建结果"
+            echo ""
+            echo "- 版本：${{ steps.info.outputs.versionName }}（${{ steps.info.outputs.versionCode }}）"
+            echo "- 中文条目：${{ steps.info.outputs.zh_written }}"
+            echo "- 仍缺译：${{ steps.info.outputs.untranslated }}"
+            echo "- SHA-256：\`${{ steps.info.outputs.sha256 }}\`"
+            echo "- 跳过（已发布同版本）：${{ steps.info.outputs.skip }}"
+          } >> "$GITHUB_STEP_SUMMARY"
