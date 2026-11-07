@@ -61,6 +61,12 @@
 
 要求：**长度必须与官方地址完全一致**（`https://raw.githubusercontent.com/vincenzobpt/MOTO-HUB-modules/main/`，68 字节），否则脚本会警告并跳过——dex 里的字符串是紧凑存储的，长度一变就得重排整个 dex。
 
+> **重要（2026-11-07 修正）**：这些地址在 APK 里**大多是混淆常量**，不是明文——形如 `base64(XOR(url, key))`，`key` 本身也是同一 dex 里的 base64 字符串（解密器类似 `KB0.m2846abstract(String enc_b64, String key_b64)`）。
+> 只替换明文副本**不会生效**（早期版本就踩过这个坑：包做了，模块页还是英文）。
+> 现在的 `zh_pipeline.py` 会自动：① 按「周期性 XOR 密钥」反推并等长重写混淆副本；② 顺手替换可能存在的明文副本；③ 重算 dex 头（adler32 + SHA-1）并回读校验。
+> 0.1.62 实测：混淆副本 3 处（基址 2 + `index.json` 1）+ 明文 1 处，全部换到镜像后 aapt2/dalvik 校验通过。
+> 以后上游若改了混淆方式，脚本会打印「没找到模块目录地址」并继续出包（模块页保持英文），不会让整次构建失败。
+
 ### 4. 先手动跑一次
 
 仓库 → **Actions → Build zh-CN APK → Run workflow**（可勾 `force`）。
@@ -106,7 +112,7 @@ python tools/zh_pipeline.py --apk "D:\path\to\MOTO-HUB-ADV-SOLO-0.1.62-64.apk" -
 | 限制 | 说明 |
 |---|---|
 | 只有 arm64-v8a | 官方包就是 arm64 单架构，汉化包保持原样 |
-| 「模块」页卡片文字 | 那 8 张卡片的标题/简介来自**远程 JSON**（`raw.githubusercontent.com/vincenzobpt/MOTO-HUB-modules/main/index.json`），不在 APK 字符串里，任何汉化包都改不了；需要作者在 `index.json` 里加多语言字段 |
+| 「模块」页卡片文字 | 那 8 张卡片的标题/简介来自**远程 JSON**（`raw.githubusercontent.com/vincenzobpt/MOTO-HUB-modules/main/index.json`），不在 APK 字符串里。配置 `MODULE_MIRROR_URL` 后本流水线会把 dex 里**混淆存放**的地址重写到你的镜像仓库（含 `index.json` 那个常量），卡片就会显示中文；不配则卡片保持英文。根治办法仍是作者在 `index.json` 里加多语言字段 |
 | 定时精度 | GitHub 的 cron 最小间隔 5 分钟，但实测触发常延迟 10–30 分钟；急用就手动 Run workflow |
 | 私有仓库额度 | 公开仓库 Actions 免费；私有仓库走你账号的分钟数（每次约 2–4 分钟） |
 | 自动翻译质量 | 只翻词库里没有的新条目，仍建议人工过一遍；品牌名/占位符有硬规则保护 |

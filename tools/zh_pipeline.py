@@ -199,12 +199,82 @@ def ensure_locale_config(decoded: Path) -> bool:
     return True
 
 
+DEX_RUN_RE = re.compile(rb"[\x20-\x7e\r\n]{8,4096}")
+
+
+def _iter_dex_runs(data: bytes):
+    for m in DEX_RUN_RE.finditer(data):
+        yield m.start(), m.group()
+
+
+def _periodic_key(cipher: bytes, plain: bytes) -> bytes | None:
+    """若 cipher XOR plain 是周期 <=32 的重复密钥，返回该密钥。"""
+    if len(cipher) != len(plain):
+        return None
+    delta = bytes(a ^ b for a, b in zip(cipher, plain))
+    for period in range(1, min(33, len(delta) + 1)):
+        if all(delta[i] == delta[i % period] for i in range(len(delta))):
+            return delta[:period]
+    return None
+
+
+def _find_encrypted(data: bytes, plaintext: str):
+    """在 dex 里找出把 plaintext 混淆存放的副本：[(offset, orig_span, key)]。
+
+    App 用 base64(XOR(url, key)) 存 URL，key 本身以 base64 存在同一 dex 里；
+    dex 的字符串前紧挨 uleb128 长度前缀（可能是可打印字符），所以每个片段要
+    试 0~3 个前导偏移再解码。
+    """
+    target = plaintext.encode()
+    found = []
+    for start, raw in _iter_dex_runs(data):
+        for k in range(4):
+            s = re.sub(rb"\s", b"", raw[k:])
+            if len(s) % 4 or len(s) < 16:
+                continue
+            try:
+                dec = base64.b64decode(s, validate=True)
+            except Exception:
+                continue
+            if len(dec) != len(target):
+                continue
+            key = _periodic_key(dec, target)
+            if key is None:
+                continue
+            if base64.b64encode(key) in data:
+                found.append((start + k, raw[k:], key))
+                break
+    return found
+
+
+def _rewrite_b64_span(span: bytes, new_plain: bytes, key: bytes) -> bytes:
+    """把一段 base64（可能夹着换行）换成新明文的密文，保留原有换行的位置。"""
+    new_b64 = base64.b64encode(bytes(a ^ b for a, b in zip(new_plain, (key * (len(new_plain) // len(key) + 1))[:len(new_plain)])))
+    out, i = bytearray(), 0
+    for ch in span:
+        if chr(ch).isalnum() or ch in b"+/=":
+            if i < len(new_b64):
+                out.append(new_b64[i])
+                i += 1
+            else:
+                out.append(ch)
+        else:
+            out.append(ch)
+    if i != len(new_b64):
+        raise ValueError(f"base64 长度不一致：写入 {i} / 期望 {len(new_b64)}")
+    return bytes(out)
+
+
 def patch_module_base_url(decoded: Path, from_url: str, to_url: str) -> bool:
-    """把 dex 里模块目录的基址换成镜像地址（等长原地替换 + 重算 dex 头）。
+    """把 dex 里模块目录的地址换成镜像地址（等长原地替换 + 重算 dex 头）。
 
     官方把「模块」页的 8 张卡片文案放在远程 index.json 里，APK 字符串表改不到；
-    把基址指向自己的镜像仓库后，卡片标题/简介就能是中文。
-    必须等长：dex 内的字符串是紧凑存储的，长度一变就要重排整个 dex。
+    把地址指向自己的镜像仓库后，卡片标题/简介就能是中文。
+
+    关键：这些地址大多**不是明文**，而是 base64(XOR(url, key)) 的混淆常量
+    （解密器形如 KB0.m2846abstract(enc_b64, key_b64)）。只替换明文副本不会生效，
+    必须把混淆副本一起换掉，因此这里按「周期性 XOR 密钥」反推并重写密文。
+    必须等长：dex 内字符串紧凑存储，长度一变就要重排整个 dex。
     """
     src, dst = from_url.encode(), to_url.encode()
     if not src or not dst:
@@ -212,26 +282,50 @@ def patch_module_base_url(decoded: Path, from_url: str, to_url: str) -> bool:
     if len(src) != len(dst):
         log(f"警告：镜像地址长度 {len(dst)} 与原地址 {len(src)} 不一致，跳过模块镜像")
         return False
-    hit = 0
+
+    targets = [from_url, from_url + "index.json"]
+    replacements = [to_url, to_url + "index.json"]
+    total_enc = total_plain = 0
     for f in sorted(decoded.glob("classes*.dex")):
         buf = bytearray(f.read_bytes())
         if not _dex_ok(bytes(buf)):
             log(f"警告：{f.name} 头校验异常，跳过模块镜像")
             return False
-        n = bytes(buf).count(src)
-        if not n:
-            continue
-        buf = bytearray(bytes(buf).replace(src, dst))
-        _fix_dex_header(buf)
-        if not _dex_ok(bytes(buf)):
-            log(f"警告：{f.name} 修补后校验失败，跳过模块镜像")
-            return False
-        f.write_bytes(bytes(buf))
-        hit += n
-    if hit != 1:
-        log(f"警告：模块基址替换 {hit} 处（预期 1 处），上游结构可能变了")
+        original = bytes(buf)
+        changed = 0
+
+        # 1) 混淆副本（原地等长重写密文）
+        for plain, repl in zip(targets, replacements):
+            for off, span, key in _find_encrypted(original, plain):
+                new_span = _rewrite_b64_span(span, repl.encode(), key)
+                if len(new_span) != len(span):
+                    log(f"警告：{f.name} 混淆副本长度变化，跳过")
+                    return False
+                buf[off:off + len(span)] = new_span
+                changed += 1
+                total_enc += 1
+
+        # 2) 明文副本（老版本可能直接存明文）
+        text = bytes(buf)
+        for plain, repl in zip(targets, replacements):
+            n = text.count(plain.encode())
+            if n:
+                text = text.replace(plain.encode(), repl.encode())
+                changed += n
+                total_plain += n
+        if changed:
+            buf = bytearray(text)
+            _fix_dex_header(buf)
+            if not _dex_ok(bytes(buf)):
+                log(f"警告：{f.name} 修补后校验失败，跳过模块镜像")
+                return False
+            f.write_bytes(bytes(buf))
+            log(f"{f.name}: 替换 {changed} 处（混淆 {total_enc}，明文 {total_plain}）")
+
+    if not (total_enc or total_plain):
+        log("警告：没找到模块目录地址（混淆/明文都没有），上游结构可能变了")
         return False
-    log(f"模块目录基址已指向镜像：{to_url}")
+    log(f"模块目录地址已指向镜像：{to_url}（混淆副本 {total_enc} 处，明文 {total_plain} 处）")
     return True
 
 
