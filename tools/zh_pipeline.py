@@ -96,7 +96,7 @@ def latest_release(token: str | None) -> dict:
             "apk_name": apk["name"], "size": apk.get("size", 0)}
 
 
-def already_built(build_repo: str | None, version_code: int, token: str | None) -> bool:
+def already_built(build_repo: str | None, tag: str, token: str | None) -> bool:
     if not build_repo or not token:
         return False
     try:
@@ -105,8 +105,8 @@ def already_built(build_repo: str | None, version_code: int, token: str | None) 
         log(f"（检查已有 release 失败，忽略：{e}）")
         return False
     for r in rels:
-        if r.get("tag_name") == f"zh-{version_code}":
-            log(f"本仓库已有 zh-{version_code}，跳过。")
+        if r.get("tag_name") == tag:
+            log(f"本仓库已有 {tag}，跳过。")
             return True
     return False
 
@@ -133,6 +133,35 @@ def read_apktool_yml(decoded: Path) -> dict:
     vc = grab("versionCode")
     vn = grab("versionName")
     return {"versionCode": int(vc) if vc and vc.isdigit() else 0, "versionName": vn or ""}
+
+
+def apply_version_override(decoded: Path, ver: dict, revision: int) -> dict:
+    """给汉化包一个比官方更高、且每次重建都能递增的版本号。
+
+    官方 versionCode 单调递增（…63、64、65…），直接沿用则「同一官方版本重打」时
+    版本号不变，Obtainium / 系统都不会认为是更新。这里改成：
+
+        versionCode = 官方 versionCode × 100 + 修订号
+        versionName = 官方 versionName + "." + 修订号     （数字点分，Obtainium 才比得清）
+
+      0.1.62 (64) + rev 2  ->  0.1.62.2 (6402)
+      官方出新版 0.1.63 (65) + rev 1 -> 0.1.63.1 (6501)，依旧更大，仍算升级。
+
+    注意：apktool 的 yml 解析器要求 versionCode 是**不带引号**的整数，写成 '6402' 会报
+    NumberFormatException: For input string: "'6402'"。
+    """
+    revision = max(1, int(revision or 1))
+    base_vc = int(ver.get("versionCode") or 0)
+    base_vn = ver.get("versionName") or "0"
+    new_vc = base_vc * 100 + revision
+    new_vn = f"{base_vn}.{revision}"
+    p = decoded / "apktool.yml"
+    txt = p.read_text(encoding="utf-8")
+    txt = re.sub(r"(?m)^(\s*versionCode:\s*)'?[^'\n]+'?\s*$", lambda m: f"{m.group(1)}{new_vc}", txt, count=1)
+    txt = re.sub(r"(?m)^(\s*versionName:\s*)'?[^'\n]+'?\s*$", lambda m: f"{m.group(1)}'{new_vn}'", txt, count=1)
+    p.write_text(txt, encoding="utf-8")
+    log(f"版本改写：{base_vn} ({base_vc}) -> {new_vn} ({new_vc})")
+    return {"versionCode": new_vc, "versionName": new_vn, "baseVersionCode": base_vc, "baseVersionName": base_vn}
 
 
 STR_RE = re.compile(r'<string name="([^"]+)"([^>]*)>(.*?)</string>', re.S)
@@ -486,7 +515,12 @@ def main() -> int:
     ver = read_apktool_yml(decoded)
     log(f"版本：{ver['versionName']} (versionCode {ver['versionCode']})")
 
-    if not args.force and not args.apk and already_built(os.environ.get("BUILD_REPO"), ver["versionCode"], token):
+    # 版本号改写：官方 ×100 + 修订号，保证「同一官方版本重打」也能被识别成更新
+    revision = int(os.environ.get("ZH_REVISION", "1") or 1)
+    ver = apply_version_override(decoded, ver, revision)
+    release_tag = f"{ver['versionName']}-zh"
+
+    if not args.force and not args.apk and already_built(os.environ.get("BUILD_REPO"), release_tag, token):
         print("SKIP=1")
         Path(work / "build-info.json").write_text(json.dumps({"skipped": True, **ver}, ensure_ascii=False, indent=2),
                                                   encoding="utf-8")
@@ -530,7 +564,7 @@ def main() -> int:
     unsigned = work / "unsigned.apk"
     log("apktool 重建…")
     apktool(["b", str(decoded), "-o", str(unsigned)])
-    out_name = f"MOTO-HUB-ADV-SOLO-{ver['versionName']}-{ver['versionCode']}-zh-CN.apk"
+    out_name = f"MOTO-HUB-ADV-SOLO-{ver['versionName']}-zh-CN.apk"
     out_apk = out_dir / out_name
     log("zipalign + 签名…")
     sign(unsigned, out_apk)
@@ -539,6 +573,7 @@ def main() -> int:
     info = verify(out_apk)
     digest = sha256(out_apk)
     info.update({"versionCode": ver["versionCode"], "versionName": ver["versionName"],
+                 "release_tag": release_tag,
                  "zh_written": written, "zh_official": official, "untranslated": len(new_list),
                  "sha256": digest, "size": out_apk.stat().st_size, "file": out_name,
                  "module_mirror": module_to if module_patched else "",
@@ -554,7 +589,7 @@ def main() -> int:
     if gh_out:
         with open(gh_out, "a", encoding="utf-8") as f:
             f.write(f"skip=0\nversion_code={ver['versionCode']}\nversion_name={ver['versionName']}\n"
-                    f"apk={out_apk}\nsha256={digest}\nuntranslated={len(new_list)}\n")
+                    f"release_tag={release_tag}\napk={out_apk}\nsha256={digest}\nuntranslated={len(new_list)}\n")
     return 0
 
 

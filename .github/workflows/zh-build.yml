@@ -16,6 +16,10 @@ on:
         description: "跳过自动翻译（新增条目暂时回退英文）"
         type: boolean
         default: false
+      revision:
+        description: "修订号：同一官方版本重打时 +1，版本号=官方×100+修订号"
+        type: string
+        default: "1"
 
 concurrency:
   group: zh-build
@@ -90,6 +94,7 @@ jobs:
           TRANSLATE_BASE_URL: ${{ vars.TRANSLATE_BASE_URL }}
           TRANSLATE_MODEL: ${{ vars.TRANSLATE_MODEL }}
           MODULE_MIRROR_URL: ${{ vars.MODULE_MIRROR_URL }}
+          ZH_REVISION: ${{ inputs.revision || '1' }}
           WORK_DIR: ${{ runner.temp }}/work
           OUT_DIR: ${{ runner.temp }}/out
         run: |
@@ -106,7 +111,7 @@ jobs:
           info = json.load(open(os.environ["RUNNER_TEMP"] + "/work/build-info.json", encoding="utf-8"))
           out = open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8")
           out.write(f"skip={1 if info.get('skipped') else 0}\n")
-          for k in ("versionCode", "versionName", "sha256", "file", "zh_written", "untranslated"):
+          for k in ("versionCode", "versionName", "sha256", "file", "zh_written", "untranslated", "release_tag"):
               if k in info:
                   out.write(f"{k}={info[k]}\n")
           PY
@@ -115,6 +120,7 @@ jobs:
         if: steps.info.outputs.skip == '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.info.outputs.release_tag }}
           VC: ${{ steps.info.outputs.versionCode }}
           VN: ${{ steps.info.outputs.versionName }}
           SHA: ${{ steps.info.outputs.sha256 }}
@@ -123,12 +129,12 @@ jobs:
         run: |
           set -euo pipefail
           APK="$(ls "$RUNNER_TEMP/out"/*.apk | head -n1)"
-          NOTES=$(printf 'MOTO-HUB ADV-SOLO %s (versionCode %s) — 简体中文汉化包\n\n- 中文条目：%s\n- 本次仍缺译（回退英文）：%s\n- SHA-256：%s\n- 安装：与上一版汉化包同一签名，可直接覆盖安装（无需卸载、不丢数据）\n' \
-            "$VN" "$VC" "$WRITTEN" "$UNTR" "$SHA")
-          gh release create "zh-$VC" "$APK" \
-            --title "zh-CN $VN (build $VC)" \
+          NOTES=$(printf 'MOTO-HUB ADV-SOLO %s — 简体中文汉化包\n\n- 中文条目：%s\n- 本次仍缺译（回退英文）：%s\n- SHA-256：%s\n- 安装：与上一版汉化包同一签名，可直接覆盖安装（无需卸载、不丢数据）\n- 版本号规则：官方版本号×100+修订号，保证 Obtainium 能识别为升级\n' \
+            "$VN" "$WRITTEN" "$UNTR" "$SHA")
+          gh release create "$TAG" "$APK" \
+            --title "zh-CN $VN" \
             --notes "$NOTES" \
-            --latest=false || gh release upload "zh-$VC" "$APK" --clobber
+            --latest=false || gh release upload "$TAG" "$APK" --clobber
 
       - name: 保存构建产物
         if: always()
