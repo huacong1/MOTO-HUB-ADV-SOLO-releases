@@ -70,9 +70,30 @@ def http_download(url: str, dest: Path, token: str | None = None) -> None:
     req = urllib.request.Request(url, headers=dict(UA))
     if token:
         req.add_header("Authorization", f"Bearer {token}")
+    if url.startswith(API + "/"):
+        # API 资产端点要显式要求二进制，否则返回 JSON 元数据
+        req.add_header("Accept", "application/octet-stream")
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(req, timeout=300) as f, open(dest, "wb") as out:
         shutil.copyfileobj(f, out)
+
+
+def download_apk(upstream: dict, dest: Path, token: str | None) -> None:
+    """下载上游 APK：优先 GitHub API 资产端点（CDN 抽风时更稳），失败再退回 release 直链。"""
+    urls = [u for u in (upstream.get("apk_api_url"), upstream.get("apk_url")) if u]
+    last = None
+    for i, url in enumerate(urls, 1):
+        try:
+            if i > 1:
+                log(f"（改用备用地址下载：{url.split('/')[-1]}）")
+            http_download(url, dest, token)
+            if upstream.get("size") and dest.stat().st_size != upstream["size"]:
+                raise IOError(f"大小不符：{dest.stat().st_size} != {upstream['size']}")
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+            log(f"下载失败（{type(e).__name__}: {e}）")
+    raise SystemExit(f"上游 APK 下载失败：{last}")
 
 
 def sha256(path: Path) -> str:
@@ -93,10 +114,18 @@ def latest_release(token: str | None) -> dict:
     apk = assets[0]
     return {"tag": rel.get("tag_name", ""), "name": rel.get("name", ""),
             "published_at": rel.get("published_at", ""), "apk_url": apk["browser_download_url"],
+            "apk_api_url": apk.get("url", ""),
             "apk_name": apk["name"], "size": apk.get("size", 0)}
 
 
-def already_built(build_repo: str | None, tag: str, token: str | None) -> bool:
+def already_built(build_repo: str | None, tag: str, token: str | None,
+                  upstream_version: str | None = None) -> bool:
+    """本仓库是否已经为这个上游版本发过包。
+
+    只看 tag 相等不够：上游版本不变时，cron 每次都会用默认修订号 1 重算出一个
+    更小的 versionCode（例如已发 0.1.62.2，cron 又想发 0.1.62.1），手机端反而
+    收不到更新。所以只要已有同一上游版本（tag 前缀 '<版本>.'）的包就跳过。
+    """
     if not build_repo or not token:
         return False
     try:
@@ -104,9 +133,14 @@ def already_built(build_repo: str | None, tag: str, token: str | None) -> bool:
     except Exception as e:  # noqa: BLE001
         log(f"（检查已有 release 失败，忽略：{e}）")
         return False
+    prefix = f"{upstream_version}." if upstream_version else None
     for r in rels:
-        if r.get("tag_name") == tag:
+        name = r.get("tag_name") or ""
+        if name == tag:
             log(f"本仓库已有 {tag}，跳过。")
+            return True
+        if prefix and name.startswith(prefix) and name.endswith("-zh"):
+            log(f"本仓库已有同上游版本的 {name}，跳过（cron 不会重发）。")
             return True
     return False
 
@@ -506,13 +540,14 @@ def main() -> int:
         apk_path = work / upstream["apk_name"]
         if not apk_path.exists() or apk_path.stat().st_size != upstream["size"]:
             log("下载中…")
-            http_download(upstream["apk_url"], apk_path, token)
+            download_apk(upstream, apk_path, token)
 
     # 2) 解码并读版本
     decoded = work / "decoded"
     log("apktool 解码…")
     decode(apk_path, decoded)
     ver = read_apktool_yml(decoded)
+    upstream_version = ver["versionName"]
     log(f"版本：{ver['versionName']} (versionCode {ver['versionCode']})")
 
     # 版本号改写：官方 ×100 + 修订号，保证「同一官方版本重打」也能被识别成更新
@@ -520,7 +555,8 @@ def main() -> int:
     ver = apply_version_override(decoded, ver, revision)
     release_tag = f"{ver['versionName']}-zh"
 
-    if not args.force and not args.apk and already_built(os.environ.get("BUILD_REPO"), release_tag, token):
+    if not args.force and not args.apk and already_built(os.environ.get("BUILD_REPO"), release_tag, token,
+                                                          upstream_version):
         print("SKIP=1")
         Path(work / "build-info.json").write_text(json.dumps({"skipped": True, **ver}, ensure_ascii=False, indent=2),
                                                   encoding="utf-8")
