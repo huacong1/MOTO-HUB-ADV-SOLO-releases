@@ -328,68 +328,90 @@ def _rewrite_b64_span(span: bytes, new_plain: bytes, key: bytes) -> bytes:
     return bytes(out)
 
 
+def _swap_plain_constants(decoded: Path, pairs: list[tuple[str, str]], label: str) -> bool:
+    """把 dex 里若干「等长」常量原地换掉（混淆副本 + 明文副本），重算 dex 头并校验。
+
+    这些常量大多**不是明文**，而是 base64(XOR(plain, key)) 的混淆常量（解密器形如
+    KB0.m2846abstract(enc_b64, key_b64)）。只替换明文副本不会生效，必须把混淆副本
+    一起换掉，因此这里按「周期性 XOR 密钥」反推并重写密文。
+    必须等长：dex 内字符串紧凑存储，长度一变就要重排整个 dex。
+    """
+    if not pairs:
+        return False
+    for old, new in pairs:
+        if not old or not new:
+            return False
+        if len(old) != len(new):
+            log(f"警告：{label} 新值长度 {len(new)} 与原值 {len(old)} 不一致，跳过")
+            return False
+
+    total_enc = total_plain = 0
+    for f in sorted(decoded.glob("classes*.dex")):
+        buf = bytearray(f.read_bytes())
+        if not _dex_ok(bytes(buf)):
+            log(f"警告：{f.name} 头校验异常，跳过{label}")
+            return False
+        original = bytes(buf)
+        changed_enc = changed_plain = 0
+
+        # 1) 混淆副本（原地等长重写密文）
+        for old, new in pairs:
+            for off, span, key in _find_encrypted(original, old):
+                new_span = _rewrite_b64_span(span, new.encode(), key)
+                if len(new_span) != len(span):
+                    log(f"警告：{f.name} 混淆副本长度变化，跳过{label}")
+                    return False
+                buf[off:off + len(span)] = new_span
+                changed_enc += 1
+
+        # 2) 明文副本（老版本/其它调用点可能直接存明文）
+        for old, new in pairs:
+            text = bytes(buf)
+            n = text.count(old.encode())
+            if n:
+                buf = bytearray(text.replace(old.encode(), new.encode()))
+                changed_plain += n
+
+        if changed_enc or changed_plain:
+            _fix_dex_header(buf)
+            if not _dex_ok(bytes(buf)):
+                log(f"警告：{f.name} 修补后校验失败，跳过{label}")
+                return False
+            f.write_bytes(bytes(buf))
+            total_enc += changed_enc
+            total_plain += changed_plain
+            log(f"{f.name}: 替换 {changed_enc + changed_plain} 处（混淆 {changed_enc}，明文 {changed_plain}）")
+
+    if not (total_enc or total_plain):
+        log(f"警告：没找到{label}（混淆/明文都没有），上游结构可能变了")
+        return False
+    log(f"{label}已替换（混淆副本 {total_enc} 处，明文 {total_plain} 处）")
+    return True
+
+
 def patch_module_base_url(decoded: Path, from_url: str, to_url: str) -> bool:
     """把 dex 里模块目录的地址换成镜像地址（等长原地替换 + 重算 dex 头）。
 
     官方把「模块」页的 8 张卡片文案放在远程 index.json 里，APK 字符串表改不到；
     把地址指向自己的镜像仓库后，卡片标题/简介就能是中文。
-
-    关键：这些地址大多**不是明文**，而是 base64(XOR(url, key)) 的混淆常量
-    （解密器形如 KB0.m2846abstract(enc_b64, key_b64)）。只替换明文副本不会生效，
-    必须把混淆副本一起换掉，因此这里按「周期性 XOR 密钥」反推并重写密文。
-    必须等长：dex 内字符串紧凑存储，长度一变就要重排整个 dex。
     """
-    src, dst = from_url.encode(), to_url.encode()
-    if not src or not dst:
-        return False
-    if len(src) != len(dst):
-        log(f"警告：镜像地址长度 {len(dst)} 与原地址 {len(src)} 不一致，跳过模块镜像")
-        return False
+    pairs = [(from_url, to_url), (from_url + "index.json", to_url + "index.json")]
+    ok = _swap_plain_constants(decoded, pairs, "模块目录地址")
+    if ok:
+        log(f"模块目录地址已指向镜像：{to_url}")
+    return ok
 
-    targets = [from_url, from_url + "index.json"]
-    replacements = [to_url, to_url + "index.json"]
-    total_enc = total_plain = 0
-    for f in sorted(decoded.glob("classes*.dex")):
-        buf = bytearray(f.read_bytes())
-        if not _dex_ok(bytes(buf)):
-            log(f"警告：{f.name} 头校验异常，跳过模块镜像")
-            return False
-        original = bytes(buf)
-        changed = 0
 
-        # 1) 混淆副本（原地等长重写密文）
-        for plain, repl in zip(targets, replacements):
-            for off, span, key in _find_encrypted(original, plain):
-                new_span = _rewrite_b64_span(span, repl.encode(), key)
-                if len(new_span) != len(span):
-                    log(f"警告：{f.name} 混淆副本长度变化，跳过")
-                    return False
-                buf[off:off + len(span)] = new_span
-                changed += 1
-                total_enc += 1
+# App 内置的官方模块包签名公钥（Ed25519 SPKI base64，60 字符）。
+# .mhm 里的 module.sig = Ed25519(module.jar)；换成我们自己的公钥后，重签的汉化模块包
+# 就能走「官方模块」校验路径，安装体验与官方一致（不出现 DEVELOPER 标记）。
+OFFICIAL_MODULE_PUBKEY = "MCowBQYDK2VwAyEAf+OORtKbjHJGqXqEz8lqLbyQexwLkLjDWOAQ6Z4v8XE="
+OUR_MODULE_PUBKEY = "MCowBQYDK2VwAyEAeMJzaDd3TdtMzHj+ZppWZNSTPldAcM3jNc+QVuF9k1Q="
 
-        # 2) 明文副本（老版本可能直接存明文）
-        text = bytes(buf)
-        for plain, repl in zip(targets, replacements):
-            n = text.count(plain.encode())
-            if n:
-                text = text.replace(plain.encode(), repl.encode())
-                changed += n
-                total_plain += n
-        if changed:
-            buf = bytearray(text)
-            _fix_dex_header(buf)
-            if not _dex_ok(bytes(buf)):
-                log(f"警告：{f.name} 修补后校验失败，跳过模块镜像")
-                return False
-            f.write_bytes(bytes(buf))
-            log(f"{f.name}: 替换 {changed} 处（混淆 {total_enc}，明文 {total_plain}）")
 
-    if not (total_enc or total_plain):
-        log("警告：没找到模块目录地址（混淆/明文都没有），上游结构可能变了")
-        return False
-    log(f"模块目录地址已指向镜像：{to_url}（混淆副本 {total_enc} 处，明文 {total_plain} 处）")
-    return True
+def patch_module_pubkey(decoded: Path, from_b64: str, to_b64: str) -> bool:
+    """把内置的模块包签名公钥换成我们的（SPKI base64 固定 60 字符，可等长替换）。"""
+    return _swap_plain_constants(decoded, [(from_b64, to_b64)], "模块签名公钥")
 
 
 def _fix_dex_header(buf: bytearray) -> None:
@@ -590,6 +612,13 @@ def main() -> int:
     if module_to:
         module_patched = patch_module_base_url(decoded, module_from, module_to)
 
+    # 模块包签名公钥：换成我们自己的，重签的汉化模块包才能通过官方校验路径
+    module_pub_from = os.environ.get("MODULE_PUBKEY_FROM", OFFICIAL_MODULE_PUBKEY).strip()
+    module_pub_to = os.environ.get("MODULE_PUBKEY_TO", OUR_MODULE_PUBKEY).strip()
+    module_key_patched = False
+    if module_pub_to:
+        module_key_patched = patch_module_pubkey(decoded, module_pub_from, module_pub_to)
+
     new_list = []
     if missing:
         en_all = parse_strings(decoded / "res" / "values" / "strings.xml")
@@ -613,6 +642,7 @@ def main() -> int:
                  "zh_written": written, "zh_official": official, "untranslated": len(new_list),
                  "sha256": digest, "size": out_apk.stat().st_size, "file": out_name,
                  "module_mirror": module_to if module_patched else "",
+                 "module_pubkey": module_pub_to if module_key_patched else "",
                  "upstream": upstream, "skipped": False})
     (work / "build-info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     log("完成：" + json.dumps(info, ensure_ascii=False))
